@@ -33,7 +33,7 @@ jobs:
     outputs:
       coverage_path: ${{ steps.set-coverage.outputs.path }}
     steps:
-      - uses: actions/checkout@3d3c42e7c5b9e5b8c0d2b9c8a8c9e4c7b7f4c9e1 # v7.0.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup runtime
         uses: devsecops-capstone-1/ci-platform/composite-actions/setup-${{ inputs.service_type }}@v1
@@ -62,7 +62,7 @@ jobs:
     if: inputs.sast == true
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e7c5b9e5b8c0d2b9c8a8c9e4c7b7f4c9e1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       - uses: devsecops-capstone-1/ci-platform/composite-actions/codeql-scan@v1
         with:
           service_dir: ${{ inputs.service_dir }}
@@ -73,7 +73,7 @@ jobs:
     if: inputs.quality_gate == true
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e7c5b9e5b8c0d2b9c8a8c9e4c7b7f4c9e1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
@@ -101,7 +101,7 @@ jobs:
       needs.quality-gate.result != 'failure'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e7c5b9e5b8c0d2b9c8a8c9e4c7b7f4c9e1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
       - name: Azure login (OIDC)
         uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
