@@ -1,0 +1,154 @@
+name: Service CI Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      service_name: { type: string, required: true }
+      service_dir: { type: string, required: true }
+      service_type: { type: string, required: true }
+      build_system: { type: string, required: true }
+      dockerfile: { type: string, required: true }
+      context: { type: string, required: true }
+      image_name: { type: string, required: true }
+      image_tag: { type: string, required: true }
+      test_enabled: { type: boolean, required: true }
+      test_path: { type: string, required: true }
+      test_command: { type: string, required: true }
+      sast: { type: boolean, required: true }
+      quality_gate: { type: boolean, required: true }
+      image_scan: { type: boolean, required: true }
+      sbom: { type: boolean, required: true }
+    secrets:
+      SONAR_TOKEN:
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      coverage_path: ${{ steps.set-coverage.outputs.path }}
+    steps:
+      - uses: actions/checkout@3d3c42e7c5b9e5b8c0d2b9c8a8c9e4c7b7f4c9e1 # v7.0.1
+
+      - name: Setup runtime
+        uses: devsecops-capstone-1/ci-platform/composite-actions/setup-${{ inputs.service_type }}@v1
+        with:
+          working_dir: ${{ inputs.service_dir }}
+
+      - name: Run unit tests
+        if: inputs.test_enabled == true
+        working-directory: ${{ inputs.service_dir }}
+        run: ${{ inputs.test_command }}
+
+      - name: Locate coverage report
+        id: set-coverage
+        if: inputs.test_enabled == true
+        run: echo "path=${{ inputs.service_dir }}/coverage" >> "$GITHUB_OUTPUT"
+
+      - name: Upload coverage artifact
+        if: inputs.test_enabled == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ inputs.service_name }}
+          path: ${{ steps.set-coverage.outputs.path }}
+
+  sast:
+    needs: build-and-test
+    if: inputs.sast == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e7c5b9e5b8c0d2b9c8a8c9e4c7b7f4c9e1
+      - uses: devsecops-capstone-1/ci-platform/composite-actions/codeql-scan@v1
+        with:
+          service_dir: ${{ inputs.service_dir }}
+          language: ${{ inputs.service_type }}
+
+  quality-gate:
+    needs: build-and-test
+    if: inputs.quality_gate == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e7c5b9e5b8c0d2b9c8a8c9e4c7b7f4c9e1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-${{ inputs.service_name }}
+          path: ${{ inputs.service_dir }}/coverage
+      - uses: devsecops-capstone-1/ci-platform/composite-actions/sonarqube-scan@v1
+        with:
+          service_name: ${{ inputs.service_name }}
+          service_dir: ${{ inputs.service_dir }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ============================================================
+  # Single job, in order: build (local) -> scan -> SBOM -> push -> sign
+  # Azure OIDC login happens HERE, in the same job that uses it —
+  # a separate job's login would not carry over.
+  # ============================================================
+  container-pipeline:
+    needs: [build-and-test, sast, quality-gate]
+    if: >
+      always() &&
+      needs.build-and-test.result == 'success' &&
+      needs.sast.result != 'failure' &&
+      needs.quality-gate.result != 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e7c5b9e5b8c0d2b9c8a8c9e4c7b7f4c9e1
+
+      - name: Azure login (OIDC)
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      # --- Build locally only — no push yet ---
+      - name: Build image
+        id: build
+        uses: devsecops-capstone-1/ci-platform/composite-actions/docker-build@v1
+        with:
+          dockerfile: ${{ inputs.dockerfile }}
+          context: ${{ inputs.context }}
+          image_name: ${{ inputs.image_name }}
+          image_tag: ${{ inputs.image_tag }}
+          acr_name: ${{ vars.ACR_NAME }}
+
+      # --- Gates run against the LOCAL image, before it can reach ACR ---
+      - name: Scan image
+        if: inputs.image_scan == true
+        uses: devsecops-capstone-1/ci-platform/composite-actions/trivy-image-scan@v1
+        with:
+          image_ref: ${{ steps.build.outputs.local_image_ref }}
+
+      - name: Generate SBOM
+        if: inputs.sbom == true
+        uses: devsecops-capstone-1/ci-platform/composite-actions/generate-sbom@v1
+        with:
+          image_ref: ${{ steps.build.outputs.local_image_ref }}
+
+      # --- Only now does the image leave the runner ---
+      - name: Push image
+        id: push
+        uses: devsecops-capstone-1/ci-platform/composite-actions/docker-push@v1
+        with:
+          local_image_ref: ${{ steps.build.outputs.local_image_ref }}
+          image_name: ${{ inputs.image_name }}
+          image_tag: ${{ inputs.image_tag }}
+          acr_name: ${{ vars.ACR_NAME }}
+
+      # --- Sign the digest that now exists in the registry ---
+      - name: Sign image
+        uses: devsecops-capstone-1/ci-platform/composite-actions/image-sign@v1
+        with:
+          image_ref: ${{ steps.push.outputs.pushed_digest_ref }}
