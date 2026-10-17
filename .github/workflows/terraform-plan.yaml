@@ -19,7 +19,6 @@ permissions:
   id-token: write # Azure OIDC
   contents: read
   actions: read # NEW: Apply needs this to fetch the plan saved by an earlier run
-  pull-requests: write
 
 jobs:
   plan:
