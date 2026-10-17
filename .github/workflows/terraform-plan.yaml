@@ -24,8 +24,6 @@ permissions:
 jobs:
   plan:
     runs-on: ubuntu-latest
-    with:
-      working_dir: .
     env:
       ARM_USE_OIDC: "true"
       ARM_USE_AZUREAD: "true" # state blob access via Entra ID, not storage keys
