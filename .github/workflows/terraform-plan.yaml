@@ -1,0 +1,91 @@
+# ci-platform/.github/workflows/terraform-plan.yml
+name: Terraform Plan
+
+on:
+  workflow_call:
+    inputs:
+      working_dir: { type: string, required: true }
+      pr_number: { type: number, required: true }
+      tfstate_container: { type: string, required: true }
+      tfstate_key: { type: string, required: true }
+      tfstate_storage_account: { type: string, required: true }
+      terraform_version: { type: string, required: false, default: "1.9.8" }
+    secrets:
+      azure_client_id: { required: true }
+      azure_tenant_id: { required: true }
+      azure_subscription_id: { required: true }
+
+permissions:
+  id-token: write # Azure OIDC
+  contents: read
+  actions: read # NEW: Apply needs this to fetch the plan saved by an earlier run
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    with:
+      working_dir: .
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true" # state blob access via Entra ID, not storage keys
+      ARM_CLIENT_ID: ${{ secrets.azure_client_id }}
+      ARM_TENANT_ID: ${{ secrets.azure_tenant_id }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.azure_subscription_id }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_dir }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      # 1. Format check: fails if code isn't terraform fmt-clean
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      # 2. Init against the remote state backend
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="storage_account_name=${{ inputs.tfstate_storage_account }}" \
+            -backend-config="container_name=${{ inputs.tfstate_container }}" \
+            -backend-config="key=${{ inputs.tfstate_key }}"
+
+      # 3. Validate: syntax and internal consistency
+      - name: Terraform validate
+        run: terraform validate
+
+      # 4. IaC security scan (the SAST equivalent for infrastructure)
+      #    Scans the WHOLE repo (.) so modules/ is covered, not just the root config
+      - name: Checkov scan
+        uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: false # any failed check blocks the PR
+
+      # 5. Plan, saved to a file
+      - name: Terraform plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Plan summary
+        run: |
+          echo '### Terraform Plan' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          terraform show -no-color tfplan >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # 6. Save the plan for the Apply workflow
+      - name: Upload plan
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: tfplan-pr-${{ inputs.pr_number }}
+          path: ${{ inputs.working_dir }}/tfplan
+          retention-days: 14

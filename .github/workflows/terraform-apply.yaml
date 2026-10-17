@@ -1,0 +1,85 @@
+# ci-platform/.github/workflows/terraform-apply.yml
+name: Terraform Apply
+
+on:
+  workflow_call:
+    inputs:
+      working_dir: { type: string, required: true }
+      pr_number: { type: number, required: true }
+      head_sha: { type: string, required: true }
+      tfstate_container: { type: string, required: true }
+      tfstate_key: { type: string, required: true }
+      tfstate_storage_account: { type: string, required: true }
+      terraform_version: { type: string, required: false, default: "1.9.8" }
+    secrets:
+      azure_client_id: { required: true }
+      azure_tenant_id: { required: true }
+      azure_subscription_id: { required: true }
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: terraform-production # the approval gate: the job pauses here until a reviewer approves
+    concurrency:
+      group: terraform-apply # never run two applies at once
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ secrets.azure_client_id }}
+      ARM_TENANT_ID: ${{ secrets.azure_tenant_id }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.azure_subscription_id }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_dir }}
+
+    steps:
+      # Check out the exact commit that was planned, not whatever main looks like now
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ inputs.head_sha }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      # The plan was saved in a different workflow run (the PR run), so find that run's ID
+      - name: Find the saved plan
+        id: find-plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=tfplan-pr-${{ inputs.pr_number }}" \
+            --jq '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == "${{ inputs.head_sha }}")]
+                  | sort_by(.created_at) | last | .workflow_run.id // empty')
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No saved plan found for PR #${{ inputs.pr_number }} at commit ${{ inputs.head_sha }}. Re-run the plan."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download the saved plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tfplan-pr-${{ inputs.pr_number }}
+          path: ${{ inputs.working_dir }}
+          run-id: ${{ steps.find-plan.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="storage_account_name=${{ inputs.tfstate_storage_account }}" \
+            -backend-config="container_name=${{ inputs.tfstate_container }}" \
+            -backend-config="key=${{ inputs.tfstate_key }}"
+
+      # Passing the plan file is what guarantees "apply exactly what was reviewed"
+      - name: Terraform apply (saved plan)
+        run: terraform apply -input=false tfplan

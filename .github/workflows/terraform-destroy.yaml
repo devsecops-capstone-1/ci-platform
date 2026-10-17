@@ -1,0 +1,104 @@
+# ci-platform/.github/workflows/terraform-destroy.yaml
+name: Terraform Destroy
+
+on:
+  workflow_call:
+    inputs:
+      working_dir: { type: string, required: true }
+      tfstate_container: { type: string, required: true }
+      tfstate_key: { type: string, required: true }
+      tfstate_storage_account: { type: string, required: true }
+      terraform_version: { type: string, required: false, default: "1.9.8" }
+    secrets:
+      azure_client_id: { required: true }
+      azure_tenant_id: { required: true }
+      azure_subscription_id: { required: true }
+
+jobs:
+  # Job 1: show what would be destroyed. Changes nothing.
+  plan-destroy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ secrets.azure_client_id }}
+      ARM_TENANT_ID: ${{ secrets.azure_tenant_id }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.azure_subscription_id }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_dir }}
+    steps:
+      - uses: actions/checkout@
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="storage_account_name=${{ inputs.tfstate_storage_account }}" \
+            -backend-config="container_name=${{ inputs.tfstate_container }}" \
+            -backend-config="key=${{ inputs.tfstate_key }}"
+
+      - name: Terraform plan (destroy)
+        run: terraform plan -destroy -input=false -out=tfdestroy
+
+      - name: Show what will be destroyed
+        run: |
+          echo '### Resources that WILL BE DESTROYED' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          terraform show -no-color tfdestroy >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfdestroy-${{ github.run_id }}
+          path: ${{ inputs.working_dir }}/tfdestroy
+          retention-days: 1
+
+  # Job 2: pauses for approval, then applies exactly that saved plan.
+  destroy:
+    needs: plan-destroy
+    runs-on: ubuntu-latest
+    environment: terraform-destroy # the approval gate
+    concurrency:
+      group: terraform-apply # shares the group with Apply so they never overlap
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ secrets.azure_client_id }}
+      ARM_TENANT_ID: ${{ secrets.azure_tenant_id }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.azure_subscription_id }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_dir }}
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      # Same workflow run, so no run-id lookup is needed (unlike Apply)
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfdestroy-${{ github.run_id }}
+          path: ${{ inputs.working_dir }}
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="storage_account_name=${{ inputs.tfstate_storage_account }}" \
+            -backend-config="container_name=${{ inputs.tfstate_container }}" \
+            -backend-config="key=${{ inputs.tfstate_key }}"
+
+      - name: Terraform apply (saved destroy plan)
+        run: terraform apply -input=false tfdestroy
